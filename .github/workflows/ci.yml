@@ -1,0 +1,40 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*.*.*']
+  pull_request:
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: shellcheck fontergeist tests/smoke.sh
+
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fzf imagemagick python3-pil fonts-dejavu-core
+      - run: tests/smoke.sh
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [shellcheck, smoke]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create release with the script as only asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sed -i "s/^VERSION=dev /VERSION=${GITHUB_REF_NAME#v} /" fontergeist
+          grep -q "^VERSION=${GITHUB_REF_NAME#v} " fontergeist
+          gh release create "$GITHUB_REF_NAME" fontergeist --title "$GITHUB_REF_NAME" --generate-notes

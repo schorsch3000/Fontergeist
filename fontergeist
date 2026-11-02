@@ -1,0 +1,318 @@
+#!/usr/bin/env bash
+# fontergeist - shows fonts that aren't even installed: browse font files with fzf
+# and a rendered preview.
+# Copyright (C) 2026 Dirk Heilig
+# SPDX-License-Identifier: GPL-3.0-or-later
+set -u
+
+VERSION=dev # replaced by the release workflow
+
+EXTENSIONS=(ttf otf ttc otc woff woff2 fon fnt pfb pfa pcf bdf dfont)
+DEFAULT_TEXT='The quick brown fox jumps over the lazy dog'
+
+usage() {
+  cat <<EOF
+Usage: fontergeist [-s SIZE] [-f COLOR] [-b COLOR] [--] [TEXT...]
+       find ~/fonts | fontergeist [options] [--] [TEXT...]
+
+Pick a font family with fzf and see TEXT rendered in every style of it
+(Regular, Bold, Italic, ...). Everything that is not an option is preview text.
+Use -- before text that starts with a dash. Without piped input, font files
+below the current directory are searched. The font files of the selected
+family are printed on stdout, one per line. Families are read with Pillow;
+without it every file is its own family.
+
+Options:
+  -s, --size SIZE         font size in pixels (default 48)
+  -f, --foreground COLOR  text color (default black)
+  -b, --background COLOR  background color (default white)
+  -V, --version
+  -h, --help
+
+Settings (precedence: options, environment, config file):
+  FONT_TEXT FONT_SIZE FONT_FG FONT_BG
+  FONT_RENDERER   kitty | wezterm | chafa (default: autodetect)
+  FONT_CELL       terminal cell size in pixels, e.g. 10x20 (default: queried)
+
+Config file: \${XDG_CONFIG_HOME:-~/.config}/fontergeist/config
+  NAME=value lines for the settings above; blank lines and # comments allowed.
+
+Keys: alt-up / alt-down change the size by 4.
+Extensions: ${EXTENSIONS[*]} (case-insensitive)
+EOF
+}
+
+die() { printf 'fontergeist: %s\n' "$*" >&2; exit 1; }
+
+# ---------------------------------------------------------------- rendering
+
+detect_renderer() {
+  if [[ -n ${FONT_RENDERER:-} ]]; then echo "$FONT_RENDERER"
+  elif [[ -n ${KITTY_WINDOW_ID:-} || ${TERM:-} == xterm-kitty ]]; then echo kitty
+  elif [[ -n ${WEZTERM_EXECUTABLE:-} ]]; then echo wezterm
+  elif command -v chafa >/dev/null; then echo chafa
+  fi
+}
+
+show_image() { # file cols lines
+  local file=$1 cols=$2 lines=$3
+  case $(detect_renderer) in
+    kitty)
+      local icat=(kitten icat)
+      command -v kitten >/dev/null || icat=(kitty +kitten icat)
+      "${icat[@]}" --clear --transfer-mode=memory --stdin=no \
+        --place="${cols}x${lines}@0x0" "$file" ;;
+    wezterm) wezterm imgcat --width "$cols" --height "$lines" "$file" ;;
+    chafa) chafa --size="${cols}x${lines}" "$file" ;;
+    *) echo "no image renderer found (need kitty, wezterm or chafa)" ;;
+  esac
+}
+
+# Bitmap fonts (.fon) load only at the sizes they contain; print the one
+# closest to the requested size. ImageMagick cannot list them, Pillow can probe.
+nearest_bitmap_size() { # file size
+  python3 -I - "$@" <<'PY'
+import sys
+from PIL import ImageFont
+
+file, size = sys.argv[1], int(sys.argv[2])
+for s in sorted(range(1, max(size * 2, 128)), key=lambda s: abs(s - size)):
+    try:
+        ImageFont.truetype(file, s)
+        print(s)
+        sys.exit()
+    except OSError:
+        pass
+sys.exit("no usable size found")
+PY
+}
+
+# The functions below use render()'s locals. Text is rendered at SIZE and
+# enlarged SCALE times (pixel-exact), so bitmap fonts stay crisp.
+im_text() { # file size scale out
+  local pct=$(($3 * 100))
+  "$magick_cmd" -background "$FONT_BG" -fill "$FONT_FG" \
+    -font "$1" -pointsize "$2" -size "$(((w - 2 * pad) / $3))x" \
+    caption:"$text" -filter point -resize "${pct}%" "png:$4" 2>&1
+}
+
+# Small label in ImageMagick's default font.
+im_label() { # text out
+  "$magick_cmd" -background "$FONT_BG" -fill "$FONT_FG" -pointsize 14 \
+    label:"$(im_escape "$1")" -bordercolor "$FONT_BG" -border 0x6 "png:$2" 2>&1
+}
+
+# ImageMagick expands %escapes and reads a file for text starting with @
+im_escape() {
+  local t=${1//%/%%}
+  [[ $t == @* ]] && t=" $t"
+  printf %s "$t"
+}
+
+# Text image for one font file; on failure the message is left in $err.
+render_one() { # file out
+  err=$(im_text "$1" "$size" 1 "$2") && return
+  # bitmap fonts (.fon) only load at the sizes they contain
+  local strike scale
+  strike=$(nearest_bitmap_size "$1" "$size" 2>&1) || { err="$err"$'\n'"$strike"; return 1; }
+  scale=$(((size + strike / 2) / strike))
+  err=$(im_text "$1" "$strike" $((scale > 0 ? scale : 1)) "$2")
+}
+
+render() { # family; called by fzf for every preview
+  exec 2>&1 # errors belong in the preview pane
+  local family=$1 size cols lines cellw cellh w h pad=16 text err magick_cmd
+  local style file i=0 parts=() tmp
+  size=$(<"$FONTERGEIST_STATE")
+  cols=${FZF_PREVIEW_COLUMNS:-80}
+  lines=${FZF_PREVIEW_LINES:-24}
+  cellw=${FONT_CELL%x*}
+  cellh=${FONT_CELL#*x}
+  w=$((cols * cellw))
+  h=$((lines * cellh))
+
+  magick_cmd=magick
+  command -v magick >/dev/null || magick_cmd=convert
+  text=$(im_escape "$FONT_TEXT")
+
+  tmp=$(mktemp -d)
+  # shellcheck disable=SC2064
+  trap "rm -rf '$tmp'" EXIT
+
+  while IFS=$'\t' read -r _ style file; do
+    i=$((i + 1))
+    parts+=("$tmp/$i-label.png" "$tmp/$i-text.png")
+    im_label "${style:+$style - }${file##*/}" "$tmp/$i-label.png" >/dev/null
+    if ! render_one "$file" "$tmp/$i-text.png"; then
+      im_label "cannot render $file"$'\n'"$(head -n 3 <<<"$err")" "$tmp/$i-text.png"
+    fi
+  done < <(awk -F'\t' -v f="$family" '$1 == f' "$FONTERGEIST_INDEX")
+
+  ((i)) || { echo "no fonts for family '$family'"; return; }
+  if ! err=$("$magick_cmd" "${parts[@]}" -background "$FONT_BG" -gravity northwest \
+      -append -bordercolor "$FONT_BG" -border "$pad" -extent "${w}x${h}" \
+      "png:$tmp/out.png" 2>&1); then
+    echo "$err"
+    return
+  fi
+  show_image "$tmp/out.png" "$cols" "$lines"
+}
+
+adjust_size() { # delta
+  local size
+  size=$(<"$FONTERGEIST_STATE")
+  size=$((size + $1))
+  ((size < 4)) && size=4
+  echo "$size" >"$FONTERGEIST_STATE"
+}
+
+# Terminal cell size in pixels as WxH (needs a terminal answering CSI 14 t).
+query_cell_size() {
+  local reply h w rows cols
+  (: </dev/tty) 2>/dev/null || return 1
+  printf '\e[14t' >/dev/tty
+  # shellcheck disable=SC2034
+  IFS= read -rs -t 0.5 -d t reply </dev/tty || return 1
+  reply=${reply#*\[4;}
+  h=${reply%%;*}
+  w=${reply#*;}
+  read -r rows cols < <(stty size </dev/tty) || return 1
+  [[ $h =~ ^[0-9]+$ && $w =~ ^[0-9]+$ ]] || return 1
+  echo "$((w / cols))x$((h / rows))"
+}
+
+# ---------------------------------------------------------------- listing
+
+list_fonts() {
+  if [[ -t 0 ]]; then
+    local args=() ext
+    for ext in "${EXTENSIONS[@]}"; do args+=(-o -iname "*.$ext"); done
+    find -L . -type f \( "${args[@]:1}" \) | sed 's|^\./||'
+  else
+    local IFS='|'
+    grep -iE "\\.(${EXTENSIONS[*]})\$"
+  fi
+}
+
+# Font files on stdin; TSV "family<TAB>style<TAB>path" on stdout, by family.
+scan_families() {
+  python3 -I -c '
+import os, sys
+
+try:
+    from PIL import ImageFont
+except ImportError:
+    ImageFont = None
+
+def names(path):
+    if ImageFont is None:
+        return None
+    # bitmap fonts only load at the sizes they contain, so probe a few
+    for size in (10, *range(1, 129)):
+        try:
+            family, style = ImageFont.truetype(path, size).getname()
+            return family, style or ""
+        except OSError as e:
+            if "invalid pixel size" not in str(e):
+                return None
+    return None
+
+rows = []
+for path in sys.stdin.read().splitlines():
+    family, style = names(path) or (os.path.splitext(os.path.basename(path))[0], "")
+    rows.append((family, style, path))
+rows.sort(key=lambda r: (r[0].lower(), r[1] not in ("Regular", "Normal", "Book", "Roman"), r[1], r[2]))
+for row in rows:
+    print(*row, sep="\t")
+'
+}
+
+# ---------------------------------------------------------------- config
+
+# NAME=value lines; real environment variables win. Parsed, not sourced.
+load_config() {
+  local file=${XDG_CONFIG_HOME:-$HOME/.config}/fontergeist/config line name value
+  [[ -r $file ]] || return 0
+  while IFS= read -r line || [[ -n $line ]]; do
+    line=${line#"${line%%[![:space:]]*}"}
+    [[ -z $line || $line == \#* ]] && continue
+    line=${line#export }
+    name=${line%%=*}
+    value=${line#*=}
+    name=${name//[[:space:]]/}
+    value=${value#"${value%%[![:space:]]*}"}
+    value=${value%"${value##*[![:space:]]}"}
+    [[ $line == *=* ]] || { echo "fontergeist: $file: ignoring '$line'" >&2; continue; }
+    case $value in
+      \"*\") value=${value#\"}; value=${value%\"} ;;
+      \'*\') value=${value#\'}; value=${value%\'} ;;
+    esac
+    case $name in
+      FONT_TEXT|FONT_SIZE|FONT_FG|FONT_BG|FONT_RENDERER|FONT_CELL)
+        [[ -n ${!name:-} ]] || export "$name=$value" ;;
+      *) echo "fontergeist: $file: unknown setting '$name'" >&2 ;;
+    esac
+  done <"$file"
+}
+
+# ---------------------------------------------------------------- main
+
+case ${1:-} in
+  __render) shift; render "$@"; exit ;;
+  __size) shift; adjust_size "$@"; exit ;;
+esac
+
+load_config
+size=${FONT_SIZE:-48}
+FONT_FG=${FONT_FG:-black}
+FONT_BG=${FONT_BG:-white}
+text=${FONT_TEXT:-$DEFAULT_TEXT}
+words=()
+
+while (($#)); do
+  case $1 in
+    -s|--size|-f|--foreground|-b|--background)
+      (($# >= 2)) || die "$1 needs a value"
+      case $1 in
+        -s|--size) size=$2 ;;
+        -f|--foreground) FONT_FG=$2 ;;
+        -b|--background) FONT_BG=$2 ;;
+      esac
+      shift 2 ;;
+    -V|--version) echo "fontergeist $VERSION"; exit 0 ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; words+=("$@"); break ;;
+    -?*) die "unknown option $1 (use -- before text starting with a dash)" ;;
+    *) words+=("$1"); shift ;;
+  esac
+done
+((${#words[@]})) && text="${words[*]}"
+[[ $size =~ ^[0-9]+$ ]] || die "size must be a number, got '$size'"
+command -v fzf >/dev/null || die "fzf not found"
+command -v magick >/dev/null || command -v convert >/dev/null || die "ImageMagick not found"
+
+FONT_CELL=${FONT_CELL:-$(query_cell_size)} || true
+FONT_CELL=${FONT_CELL:-10x20}
+FONTERGEIST_STATE=$(mktemp)
+FONTERGEIST_INDEX=$(mktemp)
+trap 'rm -f "$FONTERGEIST_STATE" "$FONTERGEIST_INDEX"' EXIT
+echo "$size" >"$FONTERGEIST_STATE"
+export FONT_TEXT=$text FONT_FG FONT_BG FONT_CELL FONTERGEIST_STATE FONTERGEIST_INDEX
+
+list_fonts | scan_families >"$FONTERGEIST_INDEX"
+[[ -s $FONTERGEIST_INDEX ]] || die "no font files found"
+
+self=$(printf %q "$(readlink -f "$0")")
+# one line per family: "Family (styles)<TAB>Family"; only the first field is shown
+selected=$(awk -F'\t' '
+  !($1 in n) { order[++k] = $1 }
+  { n[$1]++ }
+  END { for (i = 1; i <= k; i++)
+          printf "%s%s\t%s\n", order[i], (n[order[i]] > 1 ? " (" n[order[i]] ")" : ""), order[i] }
+' "$FONTERGEIST_INDEX" | fzf \
+  --delimiter '\t' --with-nth 1 \
+  --preview "$self __render {2}" \
+  --preview-window 'right,65%,border-left' \
+  --bind "alt-up:execute-silent($self __size 4)+refresh-preview" \
+  --bind "alt-down:execute-silent($self __size -4)+refresh-preview") || exit
+awk -F'\t' -v f="${selected#*$'\t'}" '$1 == f { print $3 }' "$FONTERGEIST_INDEX"
