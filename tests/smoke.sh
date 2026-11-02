@@ -37,7 +37,7 @@ check() { # description command...
   shift
   if "$@"; then echo "ok   $desc"; else echo "FAIL $desc"; failed=1; fi
 }
-# shellcheck disable=SC2317 # called through check
+# shellcheck disable=SC2317,SC2329 # called through check
 has() { grep -qxF -- "$2" "$1"; } # file line
 paths() { printf '%s\n' "$tmp"/fonts/*; }
 
